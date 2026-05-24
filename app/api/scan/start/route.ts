@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 
-import { getEnv } from "@/lib/env";
+import { getEnv, getOptionalEnv } from "@/lib/env";
 import { auditBusinessSite, searchPlaces } from "@/lib/scan/audit";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
@@ -28,6 +28,14 @@ function leadTier(score: number) {
   return "cold";
 }
 
+function hasSupabasePersistenceConfig() {
+  return Boolean(
+    getOptionalEnv("NEXT_PUBLIC_SUPABASE_URL") &&
+      getOptionalEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY") &&
+      getOptionalEnv("SUPABASE_SERVICE_ROLE_KEY"),
+  );
+}
+
 export async function POST(request: Request) {
   const body = (await request.json()) as StartScanRequest;
   const { niche, city, criteria } = normalizePayload(body);
@@ -39,22 +47,34 @@ export async function POST(request: Request) {
     );
   }
 
-  const supabase = await createClient();
-  const admin = createAdminClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  const isDemo = !user;
+  let adminClient: ReturnType<typeof createAdminClient> | null = null;
+  let userId: string | null = null;
   let currentPlan: "free" | "pro" = "free";
   let scanId: string | null = null;
   let resultLimit = 3;
 
-  if (user) {
-    const { data: profile, error: profileError } = await admin
+  if (hasSupabasePersistenceConfig()) {
+    try {
+      const supabase = await createClient();
+      adminClient = createAdminClient();
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      userId = user?.id ?? null;
+    } catch {
+      // Run in demo mode if Supabase auth/session cannot be initialized.
+      adminClient = null;
+      userId = null;
+    }
+  }
+
+  const isDemo = !userId || !adminClient;
+
+  if (userId && adminClient) {
+    const { data: profile, error: profileError } = await adminClient
       .from("users")
       .select("plan, scans_used_this_month")
-      .eq("id", user.id)
+      .eq("id", userId)
       .single();
 
     if (profileError) {
@@ -77,10 +97,10 @@ export async function POST(request: Request) {
     currentPlan = profile.plan;
     resultLimit = currentPlan === "pro" ? 50 : 10;
 
-    const { data: createdScan, error: createScanError } = await admin
+    const { data: createdScan, error: createScanError } = await adminClient
       .from("scans")
       .insert({
-        user_id: user.id,
+        user_id: userId,
         niche,
         city,
         status: "running",
@@ -109,8 +129,8 @@ export async function POST(request: Request) {
     });
 
     if (businesses.length === 0) {
-      if (scanId) {
-        await admin
+      if (scanId && adminClient) {
+        await adminClient
           .from("scans")
           .update({ status: "done", result_count: 0 })
           .eq("id", scanId);
@@ -120,8 +140,7 @@ export async function POST(request: Request) {
         scan_id: scanId,
         leads_count: 0,
         leads: [],
-        message:
-          "No businesses found, try a broader niche or different city",
+        message: "No businesses found, try a broader niche or different city",
       });
     }
 
@@ -147,8 +166,8 @@ export async function POST(request: Request) {
       leads.push(auditedLead);
     }
 
-    if (scanId && user) {
-      const { error: leadsInsertError } = await admin.from("leads").insert(
+    if (scanId && userId && adminClient) {
+      const { error: leadsInsertError } = await adminClient.from("leads").insert(
         leads.map((lead) => ({
           scan_id: scanId,
           business_name: lead.businessName,
@@ -171,7 +190,7 @@ export async function POST(request: Request) {
         throw new Error(`Lead insert failed: ${leadsInsertError.message}`);
       }
 
-      const { error: updateScanError } = await admin
+      const { error: updateScanError } = await adminClient
         .from("scans")
         .update({ status: "done", result_count: leads.length })
         .eq("id", scanId);
@@ -180,17 +199,17 @@ export async function POST(request: Request) {
         throw new Error(`Scan update failed: ${updateScanError.message}`);
       }
 
-      const { data: profile } = await admin
+      const { data: profile } = await adminClient
         .from("users")
         .select("plan, scans_used_this_month")
-        .eq("id", user.id)
+        .eq("id", userId)
         .single();
 
       if (profile?.plan === "free") {
-        await admin
+        await adminClient
           .from("users")
           .update({ scans_used_this_month: profile.scans_used_this_month + 1 })
-          .eq("id", user.id);
+          .eq("id", userId);
       }
     }
 
@@ -204,8 +223,8 @@ export async function POST(request: Request) {
       mode: isDemo ? "demo" : currentPlan,
     });
   } catch (error) {
-    if (scanId) {
-      await admin.from("scans").update({ status: "error" }).eq("id", scanId);
+    if (scanId && adminClient) {
+      await adminClient.from("scans").update({ status: "error" }).eq("id", scanId);
     }
 
     return NextResponse.json(
