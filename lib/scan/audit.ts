@@ -1,4 +1,6 @@
 const DEFAULT_TIMEOUT_MS = 5000;
+const DISCOVERY_TIMEOUT_MS = 20_000;
+const DISCOVERY_MAX_RETRIES = 2;
 const MAX_HTML_BYTES = 30_000;
 const OSM_SEARCH_RADIUS_METERS = 12_000;
 
@@ -61,6 +63,45 @@ function withTimeout(ms = DEFAULT_TIMEOUT_MS): AbortSignal {
   return AbortSignal.timeout(ms);
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+  retries = DISCOVERY_MAX_RETRIES,
+) {
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        ...init,
+        signal: withTimeout(timeoutMs),
+      });
+
+      if (response.status >= 500 && attempt < retries) {
+        await sleep(350 * (attempt + 1));
+        continue;
+      }
+
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries) {
+        await sleep(350 * (attempt + 1));
+        continue;
+      }
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("Network request failed");
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
@@ -92,7 +133,7 @@ async function getGooglePlaceDetails(
     `&key=${encodeURIComponent(apiKey)}`;
 
   try {
-    const response = await fetch(url, { signal: withTimeout(10_000) });
+    const response = await fetchWithRetry(url, {}, DISCOVERY_TIMEOUT_MS);
     if (!response.ok) return null;
 
     const json = await response.json();
@@ -116,7 +157,7 @@ async function searchPlacesWithGoogle(params: {
     `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}` +
     `&type=establishment&key=${encodeURIComponent(apiKey)}`;
 
-  const response = await fetch(url, { signal: withTimeout(10_000) });
+  const response = await fetchWithRetry(url, {}, DISCOVERY_TIMEOUT_MS);
   if (!response.ok) {
     throw new Error(`Google Places search failed with status ${response.status}`);
   }
@@ -176,15 +217,13 @@ function formatAddress(tags: Record<string, string>, city: string): string {
     tags["addr:city"] ?? city,
   ].filter(Boolean);
 
-  if (parts.length === 0) return city;
-
-  return parts.join(", ");
+  return parts.length === 0 ? city : parts.join(", ");
 }
 
 function mapOverpassElement(
   element: OverpassElement,
   city: string,
-): PlaceDetailsResult | null {
+): { place: PlaceDetailsResult; tags: Record<string, string> } | null {
   const tags = element.tags;
   if (!tags?.name) return null;
 
@@ -192,11 +231,14 @@ function mapOverpassElement(
   if (!website) return null;
 
   return {
-    place_id: `${element.type}/${element.id}`,
-    name: tags.name,
-    website,
-    formatted_phone_number: tags.phone ?? tags["contact:phone"],
-    formatted_address: formatAddress(tags, city),
+    place: {
+      place_id: `${element.type}/${element.id}`,
+      name: tags.name,
+      website,
+      formatted_phone_number: tags.phone ?? tags["contact:phone"],
+      formatted_address: formatAddress(tags, city),
+    },
+    tags,
   };
 }
 
@@ -205,10 +247,11 @@ async function getCityCoordinates(city: string) {
     "https://nominatim.openstreetmap.org/search" +
     `?format=jsonv2&limit=1&countrycodes=de&q=${encodeURIComponent(`${city}, Germany`)}`;
 
-  const response = await fetch(url, {
-    headers: OSM_HEADERS,
-    signal: withTimeout(10_000),
-  });
+  const response = await fetchWithRetry(
+    url,
+    { headers: OSM_HEADERS },
+    DISCOVERY_TIMEOUT_MS,
+  );
   if (!response.ok) {
     throw new Error(`Nominatim lookup failed with status ${response.status}`);
   }
@@ -236,7 +279,7 @@ async function searchPlacesWithOsm(params: {
   const { lat, lon } = await getCityCoordinates(city);
 
   const overpassQuery = `
-[out:json][timeout:25];
+[out:json][timeout:45];
 (
   node["name"]["website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
   way["name"]["website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
@@ -248,15 +291,18 @@ async function searchPlacesWithOsm(params: {
 out tags center;
 `.trim();
 
-  const response = await fetch("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    headers: {
-      ...OSM_HEADERS,
-      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+  const response = await fetchWithRetry(
+    "https://overpass-api.de/api/interpreter",
+    {
+      method: "POST",
+      headers: {
+        ...OSM_HEADERS,
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+      },
+      body: new URLSearchParams({ data: overpassQuery }),
     },
-    body: new URLSearchParams({ data: overpassQuery }),
-    signal: withTimeout(20_000),
-  });
+    40_000,
+  );
 
   if (!response.ok) {
     throw new Error(`Overpass lookup failed with status ${response.status}`);
@@ -268,14 +314,7 @@ out tags center;
     : []) as OverpassElement[];
 
   const mappedEntries = elements
-    .map((element) => {
-      const place = mapOverpassElement(element, city);
-      if (!place) return null;
-      return {
-        place,
-        tags: element.tags ?? {},
-      };
-    })
+    .map((element) => mapOverpassElement(element, city))
     .filter(
       (
         entry,
@@ -321,11 +360,9 @@ export async function searchPlaces(params: {
         maxResults,
       });
 
-      if (googlePlaces.length > 0) {
-        return googlePlaces;
-      }
+      if (googlePlaces.length > 0) return googlePlaces;
     } catch {
-      // Fallback to OSM when Google API has errors or quota issues.
+      // Fall back to OpenStreetMap when Google fails or times out.
     }
   }
 
@@ -354,9 +391,7 @@ async function fetchPageSpeed(url: string): Promise<number | null> {
 async function checkHttps(url: string): Promise<boolean> {
   try {
     const parsed = new URL(url);
-    if (parsed.protocol === "https:") {
-      return true;
-    }
+    if (parsed.protocol === "https:") return true;
   } catch {
     return false;
   }
@@ -407,9 +442,7 @@ function resolveChecks(criteria: string[]): Set<CheckKey> {
   const filtered = criteria.filter((value): value is CheckKey =>
     CHECK_KEYS.includes(value as CheckKey),
   );
-  if (filtered.length === 0) {
-    return new Set(CHECK_KEYS);
-  }
+  if (filtered.length === 0) return new Set(CHECK_KEYS);
   return new Set(filtered);
 }
 

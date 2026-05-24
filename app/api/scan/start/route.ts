@@ -115,14 +115,16 @@ export async function POST(request: Request) {
       leads: badLeads,
     });
   } catch (error) {
-    return NextResponse.json(
-      {
-        error:
-          error instanceof Error
-            ? `Live scan failed: ${error.message}`
-            : "Live scan failed. Please try again.",
-      },
-      { status: 502 },
-    );
+    const message = error instanceof Error ? error.message : "Unknown error";
+    const isTimeout = /timeout|aborted/i.test(message);
+
+    return responseWithLeads({
+      niche,
+      city,
+      leads: [],
+      message: isTimeout
+        ? "Live scan timed out. Please retry or narrow your niche/city search."
+        : `Live scan failed: ${message}`,
+    });
   }
 }
