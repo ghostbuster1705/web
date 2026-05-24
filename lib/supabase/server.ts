@@ -1,21 +1,28 @@
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
 
-export async function createClient() {
-  const cookieStore = await cookies();
+import { getEnv } from "@/lib/env";
+import type { Database } from "@/lib/supabase/types";
 
-  return createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+export async function createClient() {
+  const cookieStore = cookies();
+
+  return createServerClient<Database>(
+    getEnv("NEXT_PUBLIC_SUPABASE_URL"),
+    getEnv("NEXT_PUBLIC_SUPABASE_ANON_KEY"),
     {
       cookies: {
         getAll() {
           return cookieStore.getAll();
         },
         setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) =>
-            cookieStore.set(name, value, options),
-          );
+          try {
+            cookiesToSet.forEach(({ name, value, options }) =>
+              cookieStore.set(name, value, options),
+            );
+          } catch {
+            // Ignore in Server Components when headers are immutable.
+          }
         },
       },
     },
