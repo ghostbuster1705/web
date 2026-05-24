@@ -1,9 +1,12 @@
-import { notFound, redirect } from "next/navigation";
+"use client";
+
+import Link from "next/link";
+import { useEffect, useMemo, useState } from "react";
 
 import { LeadsTable, type ScanLead } from "@/components/scan/leads-table";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { classifyLead } from "@/lib/scan/classification";
-import { createClient } from "@/lib/supabase/server";
 
 type RouteContext = {
   params: {
@@ -11,45 +14,64 @@ type RouteContext = {
   };
 };
 
-function jsonArrayToStrings(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((entry): entry is string => typeof entry === "string");
+type PublicStoredLead = {
+  businessName: string;
+  websiteUrl: string;
+  score: number;
+  issues: string[];
+  pageSpeed?: number | null;
+  hasHttps?: boolean;
+  hasMobile?: boolean;
+  hasAnalytics?: boolean;
+  techStack?: string[];
+  googlePlaceId?: string;
+};
+
+type PublicStoredScan = {
+  id: string;
+  niche: string;
+  city: string;
+  status: "done";
+  createdAt: string;
+  leads: PublicStoredLead[];
+};
+
+function mapToTableLead(lead: PublicStoredLead, index: number): ScanLead {
+  return {
+    id: lead.googlePlaceId ?? `${lead.businessName}-${index}`,
+    business_name: lead.businessName,
+    website_url: lead.websiteUrl ?? null,
+    score: typeof lead.score === "number" ? lead.score : null,
+    issues: Array.isArray(lead.issues) ? lead.issues : [],
+    page_speed: typeof lead.pageSpeed === "number" ? lead.pageSpeed : null,
+    has_https: typeof lead.hasHttps === "boolean" ? lead.hasHttps : null,
+    has_mobile: typeof lead.hasMobile === "boolean" ? lead.hasMobile : null,
+    has_analytics: typeof lead.hasAnalytics === "boolean" ? lead.hasAnalytics : null,
+    tech_stack: Array.isArray(lead.techStack) ? lead.techStack : [],
+    outreach_email: null,
+  };
 }
 
-export default async function ScanResultPage({ params }: RouteContext) {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+export default function ScanResultPage({ params }: RouteContext) {
+  const [scan, setScan] = useState<PublicStoredScan | null>(null);
 
-  if (!user) {
-    redirect("/login");
-  }
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("siteaudit:lastScan");
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as PublicStoredScan;
+      if (params.id === "latest" || parsed.id === params.id) {
+        setScan(parsed);
+      }
+    } catch {
+      setScan(null);
+    }
+  }, [params.id]);
 
-  const { data: scan, error: scanError } = await supabase
-    .from("scans")
-    .select("id, niche, city, status, result_count, created_at")
-    .eq("id", params.id)
-    .eq("user_id", user.id)
-    .single();
-
-  if (scanError || !scan) {
-    notFound();
-  }
-
-  const { data: rawLeads } = await supabase
-    .from("leads")
-    .select(
-      "id, business_name, website_url, score, issues, page_speed, has_https, has_mobile, has_analytics, tech_stack, outreach_email",
-    )
-    .eq("scan_id", scan.id)
-    .order("score", { ascending: true, nullsFirst: false });
-
-  const leads: ScanLead[] = (rawLeads ?? []).map((lead) => ({
-    ...lead,
-    issues: jsonArrayToStrings(lead.issues),
-    tech_stack: jsonArrayToStrings(lead.tech_stack),
-  }));
+  const leads = useMemo(() => {
+    if (!scan) return [];
+    return scan.leads.map(mapToTableLead);
+  }, [scan]);
 
   const scores = leads
     .map((lead) => lead.score)
@@ -58,9 +80,26 @@ export default async function ScanResultPage({ params }: RouteContext) {
     scores.length === 0
       ? 0
       : Math.round(scores.reduce((acc, score) => acc + score, 0) / scores.length);
-
   const hotCount = leads.filter((lead) => classifyLead(lead.score) === "hot").length;
   const warmCount = leads.filter((lead) => classifyLead(lead.score) === "warm").length;
+
+  if (!scan) {
+    return (
+      <main className="mx-auto flex min-h-screen max-w-2xl items-center px-6 py-16">
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle>No scan results found</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4 text-sm text-zinc-700">
+            <p>Run a new scan on the homepage. No registration is required.</p>
+            <Link href="/">
+              <Button>Back to scanner</Button>
+            </Link>
+          </CardContent>
+        </Card>
+      </main>
+    );
+  }
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl space-y-6 px-6 py-12">

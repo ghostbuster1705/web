@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,12 +16,30 @@ type DemoLead = {
   score: number;
   issues: string[];
   tier: "hot" | "warm" | "cold";
+  googlePlaceId?: string;
+  pageSpeed?: number | null;
+  hasHttps?: boolean;
+  hasMobile?: boolean;
+  hasAnalytics?: boolean;
+  techStack?: string[];
 };
 
 type ScanResponse = {
+  scan_id?: string | null;
+  niche?: string;
+  city?: string;
   leads?: DemoLead[];
   message?: string;
   error?: string;
+};
+
+type PublicScanPayload = {
+  id: string;
+  niche: string;
+  city: string;
+  status: "done";
+  createdAt: string;
+  leads: DemoLead[];
 };
 
 const CRITERIA_OPTIONS = [
@@ -48,6 +67,7 @@ function tierLabel(tier: DemoLead["tier"]) {
 }
 
 export function DemoScanForm() {
+  const router = useRouter();
   const [niche, setNiche] = useState("Restaurant");
   const [city, setCity] = useState("Berlin");
   const [criteria, setCriteria] = useState<string[]>([]);
@@ -78,8 +98,20 @@ export function DemoScanForm() {
         return;
       }
 
-      setResults((json.leads ?? []).slice(0, 3));
+      const leads = json.leads ?? [];
+      setResults(leads.slice(0, 3));
       setMessage(json.message ?? null);
+
+      const payload: PublicScanPayload = {
+        id: "latest",
+        niche: json.niche ?? niche,
+        city: json.city ?? city,
+        status: "done",
+        createdAt: new Date().toISOString(),
+        leads,
+      };
+      localStorage.setItem("siteaudit:lastScan", JSON.stringify(payload));
+      router.push("/scan/latest");
     } catch {
       setError("Network error. Please try again.");
       setResults([]);
@@ -97,7 +129,7 @@ export function DemoScanForm() {
   }
 
   return (
-    <Card className="border-zinc-200">
+    <Card className="border-zinc-200" id="live-demo">
       <CardHeader>
         <CardTitle className="text-2xl">Live Demo</CardTitle>
       </CardHeader>
@@ -169,7 +201,7 @@ export function DemoScanForm() {
         {!isLoading && results.length > 0 && (
           <div className="grid gap-3 sm:grid-cols-3">
             {results.map((lead) => (
-              <div key={lead.websiteUrl} className="rounded-lg border border-zinc-200 p-3">
+              <div key={`${lead.websiteUrl}-${lead.businessName}`} className="rounded-lg border border-zinc-200 p-3">
                 <p className="font-medium text-zinc-900">{lead.businessName}</p>
                 <p className="mt-1 text-xs text-zinc-500">{lead.websiteUrl}</p>
                 <div className="mt-2 flex items-center justify-between">

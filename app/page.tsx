@@ -8,13 +8,13 @@ const FEATURE_ITEMS = [
   "Google Places lead discovery for German local businesses",
   "Website quality audit with score from 0 to 100",
   "Automatic issue detection (mobile, HTTPS, analytics, speed)",
-  "AI-generated German outreach email for Pro users",
+  "No registration required — scan instantly",
 ];
 
 const FAQ_ITEMS = [
   {
-    q: "Kann ich SiteAudit Pro kostenlos testen?",
-    a: "Ja, der Free Plan enthält 5 Scans pro Monat und bis zu 10 Ergebnisse pro Scan.",
+    q: "Muss ich mich registrieren?",
+    a: "Nein. Sie können den Scanner direkt ohne Konto nutzen.",
   },
   {
     q: "Welche Städte werden unterstützt?",
@@ -44,9 +44,9 @@ export default function Home() {
               professionellen Kontaktaufnahme.
             </p>
             <div className="flex flex-wrap items-center gap-3">
-              <Link href="/signup">
-                <Button size="lg">Jetzt starten</Button>
-              </Link>
+              <a href="#live-demo">
+                <Button size="lg">Jetzt kostenlos scannen</Button>
+              </a>
               <Link href="/pricing">
                 <Button size="lg" variant="secondary">
                   Preise ansehen
@@ -69,13 +69,13 @@ export default function Home() {
       <section className="mx-auto grid max-w-6xl gap-6 px-6 pb-14 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle>Free Plan</CardTitle>
+            <CardTitle>Public Access</CardTitle>
           </CardHeader>
           <CardContent className="space-y-2 text-sm text-zinc-700">
-            <p>5 scans / month</p>
-            <p>10 results / scan</p>
-            <p>No email generation</p>
-            <p>No CSV export</p>
+            <p>No registration</p>
+            <p>Run scans instantly</p>
+            <p>See hot/warm/cold lead scoring</p>
+            <p>Use from any device</p>
           </CardContent>
         </Card>
         <Card>
