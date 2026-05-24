@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 
-import { getOptionalEnv } from "@/lib/env";
 import { auditBusinessSite, type LeadAuditResult, searchPlaces } from "@/lib/scan/audit";
 
 const MAX_PLACES = 20;
@@ -60,22 +59,10 @@ export async function POST(request: Request) {
     );
   }
 
-  const placesApiKey = getOptionalEnv("GOOGLE_PLACES_API_KEY");
-  if (!placesApiKey) {
-    return NextResponse.json(
-      {
-        error:
-          "Real scans need GOOGLE_PLACES_API_KEY. Please set it to fetch real websites.",
-      },
-      { status: 503 },
-    );
-  }
-
   try {
     const businesses = await searchPlaces({
       niche,
       city,
-      apiKey: placesApiKey,
       maxResults: MAX_PLACES,
     });
 

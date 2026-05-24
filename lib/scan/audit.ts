@@ -1,11 +1,6 @@
 const DEFAULT_TIMEOUT_MS = 5000;
 const MAX_HTML_BYTES = 30_000;
-
-type PlaceSearchResult = {
-  place_id: string;
-  name: string;
-  formatted_address?: string;
-};
+const OSM_SEARCH_RADIUS_METERS = 12_000;
 
 type PlaceDetailsResult = {
   place_id: string;
@@ -13,6 +8,17 @@ type PlaceDetailsResult = {
   website?: string;
   formatted_phone_number?: string;
   formatted_address?: string;
+};
+
+type NominatimCityResult = {
+  lat: string;
+  lon: string;
+};
+
+type OverpassElement = {
+  id: number;
+  type: string;
+  tags?: Record<string, string>;
 };
 
 export type LeadAuditResult = {
@@ -42,6 +48,11 @@ const CHECK_KEYS = [
 
 type CheckKey = (typeof CHECK_KEYS)[number];
 
+const OSM_HEADERS = {
+  "User-Agent": "SiteAuditPro/1.0 (https://siteaudit-pro.app)",
+  "Accept-Language": "de,en;q=0.8",
+};
+
 function withTimeout(ms = DEFAULT_TIMEOUT_MS): AbortSignal {
   return AbortSignal.timeout(ms);
 }
@@ -51,6 +62,8 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function normalizeWebsite(url: string): string | null {
+  if (!url) return null;
+
   try {
     const parsed = new URL(url);
     return parsed.toString();
@@ -64,61 +77,158 @@ function normalizeWebsite(url: string): string | null {
   }
 }
 
-async function getPlaceDetails(
-  placeId: string,
-  apiKey: string,
-): Promise<PlaceDetailsResult | null> {
-  const url =
-    `https://maps.googleapis.com/maps/api/place/details/json?` +
-    `place_id=${encodeURIComponent(placeId)}` +
-    `&fields=place_id,name,website,formatted_phone_number,formatted_address` +
-    `&key=${encodeURIComponent(apiKey)}`;
+function nicheTokens(niche: string): string[] {
+  return niche
+    .toLowerCase()
+    .split(/[\s,/.-]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 2);
+}
 
-  try {
-    const response = await fetch(url, { signal: withTimeout() });
-    if (!response.ok) {
-      return null;
-    }
+function matchesNiche(tags: Record<string, string>, niche: string): boolean {
+  const tokens = nicheTokens(niche);
+  if (tokens.length === 0) return true;
 
-    const json = await response.json();
-    if (json.status !== "OK" || !json.result) {
-      return null;
-    }
+  const haystack = [
+    tags.name,
+    tags.shop,
+    tags.amenity,
+    tags.office,
+    tags.craft,
+    tags.tourism,
+    tags.leisure,
+    tags.cuisine,
+    tags.description,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
 
-    return json.result as PlaceDetailsResult;
-  } catch {
-    return null;
+  return tokens.some((token) => haystack.includes(token));
+}
+
+function formatAddress(tags: Record<string, string>, city: string): string {
+  const parts = [
+    [tags["addr:street"], tags["addr:housenumber"]].filter(Boolean).join(" "),
+    tags["addr:postcode"],
+    tags["addr:city"] ?? city,
+  ].filter(Boolean);
+
+  if (parts.length === 0) {
+    return city;
   }
+
+  return parts.join(", ");
+}
+
+function mapOverpassElement(
+  element: OverpassElement,
+  city: string,
+): PlaceDetailsResult | null {
+  const tags = element.tags;
+  if (!tags?.name) return null;
+
+  const website = normalizeWebsite(tags.website ?? tags["contact:website"] ?? "");
+  if (!website) return null;
+
+  return {
+    place_id: `${element.type}/${element.id}`,
+    name: tags.name,
+    website,
+    formatted_phone_number: tags.phone ?? tags["contact:phone"],
+    formatted_address: formatAddress(tags, city),
+  };
+}
+
+async function getCityCoordinates(city: string) {
+  const url =
+    "https://nominatim.openstreetmap.org/search" +
+    `?format=jsonv2&limit=1&countrycodes=de&q=${encodeURIComponent(`${city}, Germany`)}`;
+
+  const response = await fetch(url, {
+    headers: OSM_HEADERS,
+    signal: withTimeout(10_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Nominatim lookup failed with status ${response.status}`);
+  }
+
+  const results = (await response.json()) as NominatimCityResult[];
+  if (!Array.isArray(results) || results.length === 0) {
+    throw new Error("City not found in OpenStreetMap");
+  }
+
+  const lat = Number(results[0].lat);
+  const lon = Number(results[0].lon);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    throw new Error("Invalid city coordinates from OpenStreetMap");
+  }
+
+  return { lat, lon };
 }
 
 export async function searchPlaces(params: {
   niche: string;
   city: string;
-  apiKey: string;
   maxResults?: number;
 }) {
-  const { niche, city, apiKey, maxResults = 20 } = params;
-  const query = `${niche} ${city}`;
-  const url =
-    `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}` +
-    `&type=establishment&key=${encodeURIComponent(apiKey)}`;
+  const { niche, city, maxResults = 20 } = params;
+  const { lat, lon } = await getCityCoordinates(city);
 
-  const response = await fetch(url, { signal: withTimeout() });
+  const overpassQuery = `
+[out:json][timeout:25];
+(
+  node["name"]["website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
+  way["name"]["website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
+  relation["name"]["website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
+  node["name"]["contact:website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
+  way["name"]["contact:website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
+  relation["name"]["contact:website"](around:${OSM_SEARCH_RADIUS_METERS},${lat},${lon});
+);
+out tags center;
+`.trim();
+
+  const response = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    headers: {
+      ...OSM_HEADERS,
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+    },
+    body: new URLSearchParams({ data: overpassQuery }),
+    signal: withTimeout(20_000),
+  });
+
   if (!response.ok) {
-    throw new Error(`Google Places search failed with status ${response.status}`);
+    throw new Error(`Overpass lookup failed with status ${response.status}`);
   }
 
   const data = await response.json();
-  const rawResults = (data.results ?? []) as PlaceSearchResult[];
-  const topResults = rawResults.slice(0, maxResults);
+  const elements = (Array.isArray(data?.elements)
+    ? data.elements
+    : []) as OverpassElement[];
 
-  const detailedResults = await Promise.all(
-    topResults.map((place) => getPlaceDetails(place.place_id, apiKey)),
+  const mapped = elements
+    .map((element) => mapOverpassElement(element, city))
+    .filter((place): place is PlaceDetailsResult => Boolean(place));
+
+  const nicheFiltered = mapped.filter((place) =>
+    matchesNiche(elements.find((el) => `${el.type}/${el.id}` === place.place_id)?.tags ?? {}, niche),
   );
 
-  return detailedResults.filter(
-    (place): place is PlaceDetailsResult => Boolean(place?.website),
+  const selected = (nicheFiltered.length > 0 ? nicheFiltered : mapped).slice(
+    0,
+    maxResults * 2,
   );
+
+  const dedupedByWebsite = new Map<string, PlaceDetailsResult>();
+  for (const place of selected) {
+    if (!place.website) continue;
+    if (!dedupedByWebsite.has(place.website)) {
+      dedupedByWebsite.set(place.website, place);
+    }
+  }
+
+  return [...dedupedByWebsite.values()].slice(0, maxResults);
 }
 
 async function fetchPageSpeed(url: string): Promise<number | null> {
@@ -255,11 +365,7 @@ export async function auditBusinessSite(params: {
     }
 
     pageSpeed = await fetchPageSpeed(normalizedUrl);
-    if (
-      activeChecks.has("pagespeed") &&
-      pageSpeed !== null &&
-      pageSpeed < 50
-    ) {
+    if (activeChecks.has("pagespeed") && pageSpeed !== null && pageSpeed < 50) {
       score -= 20;
       issues.push(`PageSpeed mobile score is low (${pageSpeed})`);
     }
