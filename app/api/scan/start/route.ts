@@ -3,9 +3,11 @@ import { NextResponse } from "next/server";
 import { getOptionalEnv } from "@/lib/env";
 import { auditBusinessSite, type LeadAuditResult, searchPlaces } from "@/lib/scan/audit";
 
-const MAX_PLACES = 20;
+const MAX_PLACES = 60;
 const BAD_LEAD_MAX_SCORE = 64;
-const MAX_RETURNED_LEADS = 20;
+const MAX_RETURNED_LEADS = 30;
+const MIN_TARGET_LEADS = 12;
+const AUDIT_CONCURRENCY = 6;
 
 type StartScanRequest = {
   niche?: string;
@@ -49,6 +51,40 @@ function responseWithLeads(params: {
   });
 }
 
+function rankLeads(leads: LeadAuditResult[]) {
+  return [...leads].sort((a, b) => {
+    if (a.score !== b.score) return a.score - b.score;
+    return b.issues.length - a.issues.length;
+  });
+}
+
+async function auditBusinesses(
+  businesses: Awaited<ReturnType<typeof searchPlaces>>,
+  criteria: string[],
+) {
+  const queue = businesses.filter((business) => Boolean(business.website));
+  const auditedLeads: LeadAuditResult[] = [];
+
+  for (let i = 0; i < queue.length; i += AUDIT_CONCURRENCY) {
+    const batch = queue.slice(i, i + AUDIT_CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map((business) =>
+        auditBusinessSite({
+          businessName: business.name,
+          websiteUrl: business.website ?? "",
+          phone: business.formatted_phone_number,
+          address: business.formatted_address,
+          placeId: business.place_id,
+          criteria,
+        }),
+      ),
+    );
+    auditedLeads.push(...batchResults);
+  }
+
+  return auditedLeads;
+}
+
 export async function POST(request: Request) {
   const body = (await request.json()) as StartScanRequest;
   const { niche, city, criteria } = normalizePayload(body);
@@ -78,41 +114,35 @@ export async function POST(request: Request) {
       });
     }
 
-    const auditedLeads = [];
-    for (const business of businesses) {
-      if (!business.website) continue;
+    const auditedLeads = await auditBusinesses(businesses, criteria);
+    const rankedLeads = rankLeads(auditedLeads);
+    const badLeads = rankedLeads.filter((lead) => lead.score <= BAD_LEAD_MAX_SCORE);
 
-      const auditedLead = await auditBusinessSite({
-        businessName: business.name,
-        websiteUrl: business.website,
-        phone: business.formatted_phone_number,
-        address: business.formatted_address,
-        placeId: business.place_id,
-        criteria,
-      });
+    const selectedLeads =
+      badLeads.length >= MIN_TARGET_LEADS
+        ? badLeads.slice(0, MAX_RETURNED_LEADS)
+        : rankedLeads.slice(0, MAX_RETURNED_LEADS);
 
-      auditedLeads.push(auditedLead);
-    }
-
-    const rankedLeads = auditedLeads.sort((a, b) => a.score - b.score);
-    const badLeads = rankedLeads
-      .filter((lead) => lead.score <= BAD_LEAD_MAX_SCORE)
-      .slice(0, MAX_RETURNED_LEADS);
-
-    if (badLeads.length === 0) {
+    if (selectedLeads.length === 0) {
       return responseWithLeads({
         niche,
         city,
         leads: [],
         message:
-          "No clearly outdated websites found in this search. Try another niche or nearby city.",
+          "No websites could be analyzed for this search. Try another niche or nearby city.",
       });
     }
+
+    const fallbackMessage =
+      badLeads.length < MIN_TARGET_LEADS
+        ? "Only a few clearly outdated websites were found, so we included the best additional prospects."
+        : undefined;
 
     return responseWithLeads({
       niche,
       city,
-      leads: badLeads,
+      leads: selectedLeads,
+      message: fallbackMessage,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";

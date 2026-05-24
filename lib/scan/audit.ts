@@ -2,7 +2,7 @@ const DEFAULT_TIMEOUT_MS = 5000;
 const DISCOVERY_TIMEOUT_MS = 20_000;
 const DISCOVERY_MAX_RETRIES = 2;
 const MAX_HTML_BYTES = 30_000;
-const OSM_SEARCH_RADIUS_METERS = 12_000;
+const OSM_SEARCH_RADIUS_METERS = 20_000;
 
 type PlaceDetailsResult = {
   place_id: string;
@@ -153,22 +153,40 @@ async function searchPlacesWithGoogle(params: {
 }) {
   const { niche, city, apiKey, maxResults } = params;
   const query = `${niche} ${city}`;
-  const url =
-    `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}` +
-    `&type=establishment&key=${encodeURIComponent(apiKey)}`;
 
-  const response = await fetchWithRetry(url, {}, DISCOVERY_TIMEOUT_MS);
-  if (!response.ok) {
-    throw new Error(`Google Places search failed with status ${response.status}`);
+  const rawResults: GooglePlaceSearchResult[] = [];
+  let nextPageToken: string | undefined;
+
+  while (rawResults.length < maxResults) {
+    const url = nextPageToken
+      ? `https://maps.googleapis.com/maps/api/place/textsearch/json?pagetoken=${encodeURIComponent(nextPageToken)}&key=${encodeURIComponent(apiKey)}`
+      : `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&type=establishment&key=${encodeURIComponent(apiKey)}`;
+
+    if (nextPageToken) {
+      // next_page_token requires a short delay before it becomes valid.
+      await sleep(2_000);
+    }
+
+    const response = await fetchWithRetry(url, {}, DISCOVERY_TIMEOUT_MS);
+    if (!response.ok) {
+      throw new Error(`Google Places search failed with status ${response.status}`);
+    }
+
+    const data = await response.json();
+    const status = data?.status;
+    if (status && status !== "OK" && status !== "ZERO_RESULTS") {
+      throw new Error(`Google Places search failed: ${status}`);
+    }
+
+    const pageResults = (data.results ?? []) as GooglePlaceSearchResult[];
+    rawResults.push(...pageResults);
+
+    nextPageToken = data.next_page_token;
+    if (!nextPageToken || pageResults.length === 0) {
+      break;
+    }
   }
 
-  const data = await response.json();
-  const status = data?.status;
-  if (status && status !== "OK" && status !== "ZERO_RESULTS") {
-    throw new Error(`Google Places search failed: ${status}`);
-  }
-
-  const rawResults = (data.results ?? []) as GooglePlaceSearchResult[];
   const topResults = rawResults.slice(0, maxResults);
 
   const detailedResults = await Promise.all(
