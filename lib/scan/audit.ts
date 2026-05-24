@@ -10,6 +10,10 @@ type PlaceDetailsResult = {
   formatted_address?: string;
 };
 
+type GooglePlaceSearchResult = {
+  place_id: string;
+};
+
 type NominatimCityResult = {
   lat: string;
   lon: string;
@@ -77,6 +81,64 @@ function normalizeWebsite(url: string): string | null {
   }
 }
 
+async function getGooglePlaceDetails(
+  placeId: string,
+  apiKey: string,
+): Promise<PlaceDetailsResult | null> {
+  const url =
+    `https://maps.googleapis.com/maps/api/place/details/json?` +
+    `place_id=${encodeURIComponent(placeId)}` +
+    `&fields=place_id,name,website,formatted_phone_number,formatted_address` +
+    `&key=${encodeURIComponent(apiKey)}`;
+
+  try {
+    const response = await fetch(url, { signal: withTimeout(10_000) });
+    if (!response.ok) return null;
+
+    const json = await response.json();
+    if (json.status !== "OK" || !json.result) return null;
+
+    return json.result as PlaceDetailsResult;
+  } catch {
+    return null;
+  }
+}
+
+async function searchPlacesWithGoogle(params: {
+  niche: string;
+  city: string;
+  apiKey: string;
+  maxResults: number;
+}) {
+  const { niche, city, apiKey, maxResults } = params;
+  const query = `${niche} ${city}`;
+  const url =
+    `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}` +
+    `&type=establishment&key=${encodeURIComponent(apiKey)}`;
+
+  const response = await fetch(url, { signal: withTimeout(10_000) });
+  if (!response.ok) {
+    throw new Error(`Google Places search failed with status ${response.status}`);
+  }
+
+  const data = await response.json();
+  const status = data?.status;
+  if (status && status !== "OK" && status !== "ZERO_RESULTS") {
+    throw new Error(`Google Places search failed: ${status}`);
+  }
+
+  const rawResults = (data.results ?? []) as GooglePlaceSearchResult[];
+  const topResults = rawResults.slice(0, maxResults);
+
+  const detailedResults = await Promise.all(
+    topResults.map((place) => getGooglePlaceDetails(place.place_id, apiKey)),
+  );
+
+  return detailedResults.filter(
+    (place): place is PlaceDetailsResult => Boolean(place?.website),
+  );
+}
+
 function nicheTokens(niche: string): string[] {
   return niche
     .toLowerCase()
@@ -114,9 +176,7 @@ function formatAddress(tags: Record<string, string>, city: string): string {
     tags["addr:city"] ?? city,
   ].filter(Boolean);
 
-  if (parts.length === 0) {
-    return city;
-  }
+  if (parts.length === 0) return city;
 
   return parts.join(", ");
 }
@@ -167,12 +227,12 @@ async function getCityCoordinates(city: string) {
   return { lat, lon };
 }
 
-export async function searchPlaces(params: {
+async function searchPlacesWithOsm(params: {
   niche: string;
   city: string;
-  maxResults?: number;
+  maxResults: number;
 }) {
-  const { niche, city, maxResults = 20 } = params;
+  const { niche, city, maxResults } = params;
   const { lat, lon } = await getCityCoordinates(city);
 
   const overpassQuery = `
@@ -207,18 +267,31 @@ out tags center;
     ? data.elements
     : []) as OverpassElement[];
 
-  const mapped = elements
-    .map((element) => mapOverpassElement(element, city))
-    .filter((place): place is PlaceDetailsResult => Boolean(place));
+  const mappedEntries = elements
+    .map((element) => {
+      const place = mapOverpassElement(element, city);
+      if (!place) return null;
+      return {
+        place,
+        tags: element.tags ?? {},
+      };
+    })
+    .filter(
+      (
+        entry,
+      ): entry is {
+        place: PlaceDetailsResult;
+        tags: Record<string, string>;
+      } => Boolean(entry),
+    );
 
-  const nicheFiltered = mapped.filter((place) =>
-    matchesNiche(elements.find((el) => `${el.type}/${el.id}` === place.place_id)?.tags ?? {}, niche),
-  );
+  const nicheFiltered = mappedEntries
+    .filter((entry) => matchesNiche(entry.tags, niche))
+    .map((entry) => entry.place);
 
-  const selected = (nicheFiltered.length > 0 ? nicheFiltered : mapped).slice(
-    0,
-    maxResults * 2,
-  );
+  const selected = (
+    nicheFiltered.length > 0 ? nicheFiltered : mappedEntries.map((entry) => entry.place)
+  ).slice(0, maxResults * 2);
 
   const dedupedByWebsite = new Map<string, PlaceDetailsResult>();
   for (const place of selected) {
@@ -231,6 +304,34 @@ out tags center;
   return [...dedupedByWebsite.values()].slice(0, maxResults);
 }
 
+export async function searchPlaces(params: {
+  niche: string;
+  city: string;
+  maxResults?: number;
+  apiKey?: string;
+}) {
+  const { niche, city, maxResults = 20, apiKey } = params;
+
+  if (apiKey) {
+    try {
+      const googlePlaces = await searchPlacesWithGoogle({
+        niche,
+        city,
+        apiKey,
+        maxResults,
+      });
+
+      if (googlePlaces.length > 0) {
+        return googlePlaces;
+      }
+    } catch {
+      // Fallback to OSM when Google API has errors or quota issues.
+    }
+  }
+
+  return searchPlacesWithOsm({ niche, city, maxResults });
+}
+
 async function fetchPageSpeed(url: string): Promise<number | null> {
   const endpoint =
     `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?` +
@@ -238,15 +339,11 @@ async function fetchPageSpeed(url: string): Promise<number | null> {
 
   try {
     const response = await fetch(endpoint, { signal: withTimeout() });
-    if (!response.ok) {
-      return null;
-    }
+    if (!response.ok) return null;
 
     const json = await response.json();
     const score = json?.lighthouseResult?.categories?.performance?.score;
-    if (typeof score !== "number") {
-      return null;
-    }
+    if (typeof score !== "number") return null;
 
     return Math.round(score * 100);
   } catch {
@@ -286,9 +383,7 @@ async function fetchHomepageHtml(url: string): Promise<string | null> {
     },
   });
 
-  if (!response.ok) {
-    return null;
-  }
+  if (!response.ok) return null;
 
   const html = await response.text();
   return html.slice(0, MAX_HTML_BYTES);

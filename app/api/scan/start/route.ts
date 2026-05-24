@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 
+import { getOptionalEnv } from "@/lib/env";
 import { auditBusinessSite, type LeadAuditResult, searchPlaces } from "@/lib/scan/audit";
 
 const MAX_PLACES = 20;
@@ -60,10 +61,12 @@ export async function POST(request: Request) {
   }
 
   try {
+    const placesApiKey = getOptionalEnv("GOOGLE_PLACES_API_KEY");
     const businesses = await searchPlaces({
       niche,
       city,
       maxResults: MAX_PLACES,
+      apiKey: placesApiKey,
     });
 
     if (businesses.length === 0) {
